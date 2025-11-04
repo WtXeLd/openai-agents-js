@@ -133,12 +133,18 @@ function isMessageItem(item: protocol.ModelItem): item is protocol.MessageItem {
 
 export function itemsToMessages(
   items: ModelRequest['input'],
+  preserveThinkingBlocks: boolean = false,
 ): ChatCompletionMessageParam[] {
   if (typeof items === 'string') {
     return [{ role: 'user', content: items }];
   }
   const result: ChatCompletionMessageParam[] = [];
   let currentAssistantMsg: ChatCompletionAssistantMessageParam | null = null;
+  let pendingThinkingBlocks: Array<{
+    type: 'thinking';
+    thinking: string;
+    signature?: string;
+  }> | null = null;
   const flushAssistantMessage = () => {
     if (currentAssistantMsg) {
       if (
@@ -162,9 +168,33 @@ export function itemsToMessages(
       const { content, role, providerData } = item;
       flushAssistantMessage();
       if (role === 'assistant') {
+        let assistantContent = extractAllAssistantContent(content);
+
+        // If we have pending thinking blocks, merge them into content
+        // This is required for Anthropic API when reasoning is enabled
+        if (pendingThinkingBlocks && pendingThinkingBlocks.length > 0) {
+          if (typeof assistantContent === 'string') {
+            // Convert string to array and prepend thinking blocks
+            assistantContent = [
+              ...pendingThinkingBlocks,
+              { type: 'text', text: assistantContent },
+            ] as any;
+          } else if (Array.isArray(assistantContent)) {
+            // Prepend thinking blocks to existing array
+            assistantContent = [
+              ...pendingThinkingBlocks,
+              ...assistantContent,
+            ] as any;
+          } else {
+            // If content is null/undefined, use only thinking blocks
+            assistantContent = pendingThinkingBlocks as any;
+          }
+          pendingThinkingBlocks = null; // Clear after using
+        }
+
         const assistant: ChatCompletionAssistantMessageParam = {
           role: 'assistant',
-          content: extractAllAssistantContent(content),
+          content: assistantContent,
           ...providerData,
         };
 
@@ -197,6 +227,32 @@ export function itemsToMessages(
       // @ts-expect-error - reasoning is not supported in the official Chat Completion API spec
       // this is handling third party providers that support reasoning
       asst.reasoning = item.rawContent?.[0]?.text;
+
+      // Reconstruct thinking blocks from rawContent (text) and encryptedContent (signature)
+      const rawContentItems = item.rawContent || [];
+      const signature = item.encryptedContent;
+
+      if (rawContentItems.length > 0 && preserveThinkingBlocks) {
+        // Reconstruct thinking blocks from rawContent and signature
+        pendingThinkingBlocks = [];
+        for (const contentItem of rawContentItems) {
+          if (contentItem.type === 'reasoning_text') {
+            const thinkingBlock: {
+              type: 'thinking';
+              thinking: string;
+              signature?: string;
+            } = {
+              type: 'thinking',
+              thinking: contentItem.text,
+            };
+            // Add signature if available
+            if (signature) {
+              thinkingBlock.signature = signature;
+            }
+            pendingThinkingBlocks.push(thinkingBlock);
+          }
+        }
+      }
       continue;
     } else if (item.type === 'hosted_tool_call') {
       if (item.name === 'file_search_call') {
@@ -240,6 +296,15 @@ export function itemsToMessages(
       );
     } else if (item.type === 'function_call') {
       const asst = ensureAssistantMessage();
+
+      // If we have pending thinking blocks, use them as the content
+      // This is required for Anthropic API tool calls with interleaved thinking
+      if (pendingThinkingBlocks) {
+        // @ts-expect-error - thinking blocks are Anthropic specific
+        asst.content = pendingThinkingBlocks;
+        pendingThinkingBlocks = null; // Clear after using
+      }
+
       const toolCalls = asst.tool_calls ?? [];
       const funcCall = item;
       toolCalls.push({

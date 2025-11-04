@@ -10,6 +10,9 @@ type StreamingState = {
   refusal_content_index_and_output: [number, protocol.Refusal] | null;
   function_calls: Record<number, protocol.FunctionCallItem>;
   reasoning: string;
+  // Store accumulated thinking text and signature for Anthropic compatibility
+  thinkingText: string;
+  thinkingSignature?: string;
 };
 
 export async function* convertChatCompletionsStreamToResponses(
@@ -23,6 +26,8 @@ export async function* convertChatCompletionsStreamToResponses(
     refusal_content_index_and_output: null,
     function_calls: {},
     reasoning: '',
+    thinkingText: '',
+    thinkingSignature: undefined,
   };
 
   for await (const chunk of stream) {
@@ -74,6 +79,24 @@ export async function* convertChatCompletionsStreamToResponses(
       state.reasoning += delta.reasoning;
     }
 
+    // Handle thinking blocks from Anthropic (for preserving signatures)
+    if ('thinking_blocks' in delta && Array.isArray(delta.thinking_blocks)) {
+      for (const block of delta.thinking_blocks) {
+        if (typeof block === 'object' && block !== null) {
+          // Accumulate thinking text
+          const thinkingText = (block as any).thinking;
+          if (typeof thinkingText === 'string') {
+            state.thinkingText += thinkingText;
+          }
+          // Store signature if present
+          const signature = (block as any).signature;
+          if (typeof signature === 'string') {
+            state.thinkingSignature = signature;
+          }
+        }
+      }
+    }
+
     // Handle refusals
     if ('refusal' in delta && delta.refusal) {
       if (!state.refusal_content_index_and_output) {
@@ -110,11 +133,30 @@ export async function* convertChatCompletionsStreamToResponses(
   const outputs: protocol.OutputModelItem[] = [];
 
   if (state.reasoning) {
-    outputs.push({
+    const reasoningItem: protocol.ReasoningItem = {
       type: 'reasoning',
       content: [],
       rawContent: [{ type: 'reasoning_text', text: state.reasoning }],
-    });
+    };
+
+    // Store thinking text in rawContent and signature in encryptedContent
+    if (state.thinkingText) {
+      // Add thinking text as a ReasoningText object
+      if (!reasoningItem.rawContent) {
+        reasoningItem.rawContent = [];
+      }
+      reasoningItem.rawContent.push({
+        type: 'reasoning_text',
+        text: state.thinkingText,
+      });
+    }
+
+    // Store signature in encryptedContent
+    if (state.thinkingSignature) {
+      reasoningItem.encryptedContent = state.thinkingSignature;
+    }
+
+    outputs.push(reasoningItem);
   }
 
   if (

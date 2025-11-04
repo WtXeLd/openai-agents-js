@@ -578,6 +578,12 @@ export const ReasoningItem = SharedBase.extend({
    * The raw reasoning text from the model.
    */
   rawContent: z.array(ReasoningText).optional(),
+
+  /**
+   * Encrypted content (signature) for Anthropic thinking blocks.
+   * Used to store the signature from Anthropic's extended thinking feature.
+   */
+  encryptedContent: z.string().optional(),
 });
 
 export type ReasoningItem = z.infer<typeof ReasoningItem>;

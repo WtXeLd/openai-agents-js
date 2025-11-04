@@ -42,6 +42,19 @@ type OpenAIMessageWithReasoning =
     reasoning: string;
   };
 
+// Anthropic thinking block type for extended thinking and interleaved thinking
+type ThinkingBlock = {
+  type: 'thinking';
+  thinking: string;
+  signature?: string;
+};
+
+// Message type with thinking blocks for Anthropic compatibility
+type ChatCompletionMessageWithThinkingBlocks =
+  OpenAI.Chat.Completions.ChatCompletionMessage & {
+    thinking_blocks?: ThinkingBlock[];
+  };
+
 function hasReasoningContent(
   message: OpenAI.Chat.Completions.ChatCompletionMessage,
 ): message is OpenAIMessageWithReasoning {
@@ -49,6 +62,16 @@ function hasReasoningContent(
     'reasoning' in message &&
     typeof message.reasoning === 'string' &&
     message.reasoning !== ''
+  );
+}
+
+function hasThinkingBlocks(
+  message: OpenAI.Chat.Completions.ChatCompletionMessage,
+): message is ChatCompletionMessageWithThinkingBlocks {
+  return (
+    'thinking_blocks' in message &&
+    Array.isArray(message.thinking_blocks) &&
+    message.thinking_blocks.length > 0
   );
 }
 
@@ -88,7 +111,7 @@ export class OpenAIChatCompletionsModel implements Model {
       const message = response.choices[0].message;
 
       if (hasReasoningContent(message)) {
-        output.push({
+        const reasoningItem: protocol.ReasoningItem = {
           type: 'reasoning',
           content: [],
           rawContent: [
@@ -97,7 +120,43 @@ export class OpenAIChatCompletionsModel implements Model {
               text: message.reasoning,
             },
           ],
-        });
+        };
+
+        // Store thinking blocks for Anthropic compatibility
+        // Use type assertion since we're checking at runtime
+        const msgWithThinking =
+          message as ChatCompletionMessageWithThinkingBlocks;
+        if (hasThinkingBlocks(msgWithThinking)) {
+          const thinkingBlocks = msgWithThinking.thinking_blocks!;
+          const rawContent: protocol.ReasoningText[] = [];
+          let signature: string | undefined;
+
+          // Extract thinking text and signature from thinking blocks
+          for (const block of thinkingBlocks) {
+            if (typeof block === 'object' && block.thinking) {
+              rawContent.push({
+                type: 'reasoning_text',
+                text: block.thinking,
+              });
+              // Store the last signature if present
+              if (block.signature) {
+                signature = block.signature;
+              }
+            }
+          }
+
+          // Store thinking text in rawContent
+          if (rawContent.length > 0) {
+            reasoningItem.rawContent = rawContent;
+          }
+
+          // Store signature in encryptedContent
+          if (signature) {
+            reasoningItem.encryptedContent = signature;
+          }
+        }
+
+        output.push(reasoningItem);
       }
       if (
         message.content !== undefined &&
@@ -286,7 +345,13 @@ export class OpenAIChatCompletionsModel implements Model {
       parallelToolCalls = request.modelSettings.parallelToolCalls;
     }
 
-    const messages = itemsToMessages(request.input);
+    // Preserve thinking blocks for tool calls when reasoning is on
+    // This is needed for models like Claude 4 Sonnet/Opus which support interleaved thinking
+    const preserveThinkingBlocks =
+      request.modelSettings.reasoning !== undefined &&
+      request.modelSettings.reasoning.effort !== undefined;
+
+    const messages = itemsToMessages(request.input, preserveThinkingBlocks);
     if (request.systemInstructions) {
       messages.unshift({
         content: request.systemInstructions,
